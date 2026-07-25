@@ -7,19 +7,27 @@
 // ---------------------------------------------------------------------------
 //  ĐỊNH DANH THIẾT BỊ
 // ---------------------------------------------------------------------------
-#define DEVICE_ID          "wm-001"          // ID duy nhất cho mỗi thiết bị
+#define DEVICE_ID          "wm_0001"          // ID duy nhất cho mỗi thiết bị
 
 // ---------------------------------------------------------------------------
 //  CẤU HÌNH MẠNG / MQTT
 // ---------------------------------------------------------------------------
-#define SIM_APN            "v-internet"       // APN nhà mạng (Viettel: v-internet)
-#define MQTT_BROKER        "tcp://broker.hivemq.com:1883"
+#define SIM_APN            "m3-world"          // APN nhà mạng (Vinaphone: m3-world)
+#define MQTT_BROKER        "tcp://172.104.53.37:1883"
 #define MQTT_CLIENT_ID     DEVICE_ID
 #define MQTT_USER          ""                 // để "" nếu broker không cần auth
 #define MQTT_PASS          ""
 #define MQTT_KEEPALIVE     60                 // giây
-#define MQTT_TOPIC_DATA    "watermeter/" DEVICE_ID "/data"
-#define MQTT_TOPIC_STATUS  "watermeter/" DEVICE_ID "/status"
+#define MQTT_TOPIC_DATA    "watermeter/" DEVICE_ID "/data"   // ⬆ số đo định kỳ (QoS1)
+#define MQTT_TOPIC_INFO    "watermeter/" DEVICE_ID "/info"   // ⬆ thông tin SIM (QoS1, retain)
+#define MQTT_TOPIC_CMD     "watermeter/" DEVICE_ID "/cmd"    // ⬇ lệnh điều khiển (subscribe, QoS1)
+#define MQTT_SUB_QOS       1                  // QoS đăng ký topic /cmd
+
+// ---------------------------------------------------------------------------
+//  LỆNH SMS (nhận qua /cmd, gửi bằng A7680C)
+// ---------------------------------------------------------------------------
+#define SMS_MAX_RECIPIENTS 5                  // số người nhận tối đa mỗi lệnh sms
+#define SMS_MAX_TEXT_LEN   120               // độ dài tối đa nội dung tin (ký tự)
 
 // ---------------------------------------------------------------------------
 //  GÁN CHÂN (STM32F103C6T6 - LQFP48)
@@ -44,6 +52,10 @@
 #define PIN_LED_R          PA6
 #define PIN_LED_G          PA7
 #define PIN_LED_B          PB1
+
+// LED onboard "blue pill" PC13 (tích cực mức THẤP): nháy khi khởi động,
+// sáng liên tục khi đã nhận được module A7680C.
+#define PIN_STATUS_LED     PC13
 
 // ---------------------------------------------------------------------------
 //  HIỆU CHUẨN CẢM BIẾN LƯU LƯỢNG (YF-S102)

@@ -17,9 +17,9 @@ pin dự phòng và LED RGB báo trạng thái.
 | Báo trạng thái        | LED RGB          | Cực âm chung, tích cực mức cao             |
 
 > **Lưu ý dung lượng:** STM32F103C6T6 chỉ có **32KB Flash**. Firmware hiện dùng
-> ~71% flash nên vẫn vừa, nhưng nếu bạn thêm tính năng và bị tràn, hãy đổi
-> `board = genericSTM32F103C8` trong `platformio.ini` (đa số "blue pill" thực tế
-> là C8/CB với 64–128KB).
+> **~80% flash** (đã khá sát trần) nên vẫn vừa, nhưng nếu bạn thêm tính năng và
+> bị tràn, hãy đổi `board = genericSTM32F103C8` trong `platformio.ini` (đa số
+> "blue pill" thực tế là C8/CB với 64–128KB).
 
 ### Sơ đồ chân (LQFP48)
 
@@ -43,20 +43,30 @@ Tất cả gán chân tập trung ở `include/config.h` — chỉnh ở đó n�
 
 - **Đo lưu lượng:** đếm xung cảm biến bằng ngắt ngoài, tính lưu lượng (L/phút)
   và tổng lượng nước (lít) mỗi 1 giây. Hệ số hiệu chuẩn: `450 xung/lít`.
-- **Gửi MQTT** khi:
+- **Gửi số đo (`/data`)** khi:
   - Định kỳ **5 giây/lần** trong lúc có nước chảy.
   - **Bắt đầu** có dòng chảy (0 → > 0).
   - **Kết thúc** dòng chảy (> 0 → 0).
   - Lưu lượng **thay đổi đột ngột** (lệch ≥ 2 L/phút so với lần gửi trước).
 - **Nội dung gửi:** lưu lượng + tổng nước + dung lượng pin + nguồn + sóng.
+- **Gửi thông tin SIM (`/info`)** một lần khi kết nối đầu tiên (retain).
+- **Nhận lệnh (`/cmd`)**: subscribe ngay khi kết nối (tự thử lại tới khi thành
+  công); hiện hỗ trợ lệnh gửi SMS. Xem cơ chế xử lý SMS ở [§2.1](#21-xử-lý-lệnh-sms).
 - **Nguồn:** chạy bằng Type-C khi có; mất Type-C thì tự chạy pin Li-ion.
 - **Offline buffering:** khi không kết nối được MQTT, dữ liệu được lưu vào bộ đệm
   vòng trong RAM (32 bản ghi) và **tự gửi bù** khi có kết nối trở lại.
 
-### Định dạng MQTT
+### Các bản tin MQTT
 
-- **Topic dữ liệu:** `watermeter/<device_id>/data`
-- **Payload (JSON):**
+`<id>` là mã thiết bị (vd. `wm-001`). Phía máy chủ web subscribe `watermeter/#`
+để nhận mọi `/data` và `/info`, và publish xuống `/cmd` khi cần điều khiển.
+
+#### ⬆️ Thiết bị GỬI LÊN broker (publish)
+
+**`watermeter/<id>/data`** — QoS 1
+
+Số đo định kỳ. Gửi khi: bắt đầu dòng chảy, kết thúc dòng chảy, định kỳ 5s lúc có
+nước, hoặc lưu lượng đổi đột ngột.
 
 ```json
 {"id":"wm-001","flow":12.50,"total":345.60,"batt":87,"pwr":"dc","rssi":19}
@@ -66,10 +76,66 @@ Tất cả gán chân tập trung ở `include/config.h` — chỉnh ở đó n�
 |---------|--------------------------------------------|
 | `id`    | ID thiết bị                                |
 | `flow`  | Lưu lượng tức thời (L/phút)                |
-| `total` | Tổng lượng nước tích luỹ (lít)            |
+| `total` | Tổng lượng nước tích luỹ của đồng hồ (lít) |
 | `batt`  | Dung lượng pin còn lại (%)                 |
 | `pwr`   | `dc` = đang cắm Type-C, `bat` = chạy pin   |
-| `rssi`  | Cường độ sóng CSQ (0–31, 99 = không rõ)    |
+| `rssi`  | Cường độ sóng 4G, CSQ (0–31, 99 = không rõ)|
+
+**`watermeter/<id>/info`** — QoS 1 · **retain**
+
+Thông tin SIM thuê bao — gửi **một lần** khi kết nối đầu tiên. Dùng cờ `retain`
+để server nhận được kể cả khi bật sau thiết bị.
+
+```json
+{"id":"wm-001","operator":"Viettel","phone":"+84961234567",
+ "iccid":"8984040123456789012","imsi":"452040123456789","imei":"860123456789012"}
+```
+
+| Trường     | Ý nghĩa                                 |
+|------------|-----------------------------------------|
+| `operator` | Tên nhà mạng (`AT+COPS?`)               |
+| `phone`    | Số thuê bao (`AT+CNUM`, có thể rỗng)    |
+| `iccid`    | Serial SIM (`AT+CICCID`)                |
+| `imsi`     | IMSI (`AT+CIMI`)                        |
+| `imei`     | IMEI thiết bị (`AT+CGSN`)               |
+
+#### ⬇️ Thiết bị NHẬN & XỬ LÝ từ broker (subscribe)
+
+**`watermeter/<id>/cmd`** — QoS 1
+
+Lệnh điều khiển do máy chủ gửi xuống. Thiết bị **subscribe** topic này ngay khi
+kết nối. Lệnh có `cmd` không nhận dạng được → **bỏ qua**.
+
+Lệnh gửi SMS — module A7680C nhận rồi tự nhắn tin bằng `AT+CMGS` tới từng số:
+
+```json
+{"cmd":"sms","to":["+84912345678","+84987654321"],"text":"Canh bao ..."}
+```
+
+| Trường | Ý nghĩa                                                     |
+|--------|------------------------------------------------------------|
+| `cmd`  | Loại lệnh — hiện hỗ trợ `sms`                               |
+| `to`   | Mảng số nhận (tối đa `SMS_MAX_RECIPIENTS` = 5)              |
+| `text` | Nội dung tin (tối đa `SMS_MAX_TEXT_LEN` = 120 ký tự, ASCII) |
+
+### 2.1. Xử lý lệnh SMS
+
+Gửi SMS bằng `AT+CMGS` là thao tác **chiếm modem khá lâu** (mỗi số có thể tới
+~60s). Để không mất số đo trong lúc đó, thiết bị xử lý như sau:
+
+1. Bản tin `/cmd` nhận được chỉ **xếp vào hàng đợi** trong RAM (không gửi ngay).
+2. Vòng lặp chính rút hàng đợi và gọi gửi SMS — lúc này modem **tạm ngưng MQTT**
+   để lo nhắn tin từng số.
+3. Trong khi chờ modem, STM32 **vẫn đếm xung (bằng ngắt) và đệm số đo vào RAM** —
+   không mất dữ liệu, `total` luôn chính xác.
+4. Gửi xong SMS → **tự kết nối lại MQTT và gửi bù** phần số đo đã đệm.
+
+> Vì keepalive MQTT là 60s mà một SMS có thể chờ tới 60s, kết nối MQTT có thể rớt
+> giữa chừng khi gửi nhiều số — thiết bị tự phục hồi, `/data` chỉ bị trễ vài giây.
+
+Bản tin `/cmd` được nhận qua **một bộ đọc URC hợp nhất**: kể cả khi lệnh tới đúng
+lúc đang chờ phản hồi một lệnh AT khác (vd. đang publish `/data`), nó vẫn được
+tách ra và xử lý, không bị bỏ sót.
 
 ---
 
@@ -100,7 +166,8 @@ src/
   flow_sensor.*       # đếm xung cảm biến, tính lưu lượng/tổng
   battery.*           # đo pin + phát hiện nguồn Type-C
   led_status.*        # điều khiển LED RGB theo ưu tiên
-  modem_a7680c.*      # driver AT: bật nguồn, mạng/PDP, MQTT publish
+  modem_a7680c.*      # driver AT: nguồn, mạng/PDP, MQTT pub/sub (bộ đọc URC), SMS, info SIM
+  command.*           # phân tích lệnh /cmd + hàng đợi SMS (vd. sms)
   data_buffer.*       # bộ đệm vòng lưu dữ liệu offline
 platformio.ini        # cấu hình build
 ```
@@ -156,5 +223,9 @@ upload_protocol = serial
 - Chưa có chế độ **ngủ tiết kiệm điện** (STOP mode) — cần thiết khi chạy pin lâu
   dài; xem thêm module đo dòng và duty-cycle của modem.
 - Có thể bổ sung **TLS (MQTTS)** cho A7680C và **OTA** cập nhật firmware.
-- Phát hiện "lỗi cảm biến" hiện là điểm móc (hook) — nên bổ sung logic phân biệt
-  "không có nước" với "cảm biến hỏng" (vd. kiểm tra hở mạch tín hiệu).
+- Phát hiện "lỗi cảm biến" hiện là điểm móc (hook) — `FlowSensor::sensorError()`
+  luôn trả `false` nên **LED "🔴 lỗi cảm biến" chưa bao giờ sáng**. Cần bổ sung
+  logic phân biệt "không có nước" với "cảm biến hỏng" (vd. kiểm tra hở mạch).
+- Gửi SMS chặn modem theo kiểu đồng bộ (blocking). Số đo không mất (vẫn đệm RAM),
+  nhưng khi gửi nhiều số, kết nối MQTT có thể rớt tạm và `/data` bị trễ. Có thể
+  nâng cấp gửi SMS **phi chặn** (state machine) nếu cần realtime chặt hơn.

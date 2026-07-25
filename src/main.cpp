@@ -16,6 +16,7 @@
 #include "led_status.h"
 #include "data_buffer.h"
 #include "modem_a7680c.h"
+#include "command.h"
 
 // ---- Trạng thái gửi dữ liệu ----
 static float    g_lastSentFlow = 0.0f;
@@ -23,6 +24,12 @@ static bool     g_wasFlowing   = false;
 static uint32_t g_lastPeriodic = 0;
 static uint32_t g_lastModemTry = 0;
 static uint32_t g_lastBattTs   = 0;
+static bool     g_prevMqtt     = false;   // trạng thái MQTT vòng lặp trước
+static bool     g_infoSent     = false;   // đã gửi /info (retain) chưa
+static bool     g_subscribed   = false;   // đã đăng ký /cmd trên kết nối hiện tại chưa
+static bool     g_smsBusy      = false;   // modem đang bận gửi SMS -> tạm ngưng MQTT
+static uint32_t g_hbTs         = 0;       // mốc nháy LED onboard PC13
+static bool     g_hbOn         = false;   // trạng thái LED onboard PC13
 
 // ---- Đổi float -> chuỗi 2 chữ số thập phân (tránh dùng printf float) ----
 static void fmt2(char *out, float v) {
@@ -76,6 +83,63 @@ static void flushBuffer() {
   }
 }
 
+// Chỉ lưu số đo vào RAM (dùng khi modem đang bận gửi SMS -> tạm ngưng MQTT).
+static void bufferReading(float flow, float total, uint8_t batt, bool dc) {
+  DataBuffer::Record r{ millis(), flow, total, batt, dc };
+  DataBuffer::push(r);
+  g_lastSentFlow = flow;   // vẫn cập nhật mốc so sánh "đột ngột"
+}
+
+// Đo lưu lượng theo cửa sổ & quyết định gửi hay đệm.
+//   bufferOnly=true  -> chỉ đệm vào RAM (khi modem đang gửi SMS)
+//   bufferOnly=false -> gửi MQTT, không được thì tự đệm
+static void serviceFlow(uint32_t now, bool bufferOnly) {
+  if (!FlowSensor::update(now)) return;
+
+  float flow  = FlowSensor::flowLpm();
+  float total = FlowSensor::totalLiters();
+  if (flow < FLOW_ZERO_EPS) flow = 0.0f;
+
+  bool flowing = flow > 0.0f;
+  bool doSend  = false;
+  if (flowing && !g_wasFlowing) doSend = true;               // bắt đầu có nước
+  if (!flowing && g_wasFlowing) doSend = true;               // dòng chảy về 0
+  if (fabsf(flow - g_lastSentFlow) >= FLOW_SUDDEN_DELTA)      // thay đổi đột ngột
+    doSend = true;
+  if (flowing && (now - g_lastPeriodic >= SEND_INTERVAL_MS))  // định kỳ 5s
+    doSend = true;
+
+  if (doSend) {
+    uint8_t batt = Battery::percent();
+    bool    dc   = Battery::onExternalPower();
+    if (bufferOnly) bufferReading(flow, total, batt, dc);
+    else            sendOrBuffer(flow, total, batt, dc);
+    g_lastPeriodic = now;
+  }
+  g_wasFlowing = flowing;
+}
+
+// ---- Dựng payload /info từ thông tin SIM thuê bao ----
+static void buildInfoPayload(char *buf, size_t n, const Modem::SimInfo &s) {
+  snprintf(buf, n,
+           "{\"id\":\"%s\",\"operator\":\"%s\",\"phone\":\"%s\","
+           "\"iccid\":\"%s\",\"imsi\":\"%s\",\"imei\":\"%s\"}",
+           DEVICE_ID, s.operatorName, s.phone, s.iccid, s.imsi, s.imei);
+}
+
+// Gửi /info (retain) đúng một lần khi vừa (tái) kết nối MQTT.
+static void sendInfoOnce() {
+  if (g_infoSent) return;
+
+  Modem::SimInfo si;
+  if (Modem::querySimInfo(si)) {
+    char info[256];
+    buildInfoPayload(info, sizeof(info), si);
+    if (Modem::mqttPublish(MQTT_TOPIC_INFO, info, /*retain=*/true))
+      g_infoSent = true;
+  }
+}
+
 // Chọn trạng thái LED theo thứ tự ưu tiên.
 static void updateLed(float flow, uint32_t now) {
   Led::Status s;
@@ -89,6 +153,29 @@ static void updateLed(float flow, uint32_t now) {
   else                                    s = Led::NO_WATER;       // dương
   Led::set(s);
   Led::update(now);
+}
+
+// LED onboard PC13 (tích cực mức THẤP):
+//   - Chưa nhận được module A7680C -> NHẤP NHÁY (báo chương trình đang chạy)
+//   - Đã nhận module -> SÁNG liên tục
+static void updateHeartbeat(uint32_t now) {
+  if (Modem::moduleError()) {
+    if (now - g_hbTs >= 200) { g_hbTs = now; g_hbOn = !g_hbOn; }   // nháy ~2.5Hz
+  } else {
+    g_hbOn = true;                                                // sáng luôn
+  }
+  digitalWrite(PIN_STATUS_LED, g_hbOn ? LOW : HIGH);              // active-low
+}
+
+// Bơm "rảnh": modem gọi hàm này trong lúc bận gửi SMS. STM32 vẫn đo xung và
+// đệm số đo vào RAM, TẠM KHÔNG publish (modem đang chiếm để gửi SMS). LED vẫn cập nhật.
+static void onModemIdle() {
+  uint32_t now = millis();
+  updateHeartbeat(now);       // nháy/sáng PC13 kể cả trong lúc modem đang bận
+  if (!g_smsBusy) return;
+  serviceFlow(now, /*bufferOnly=*/true);
+  float f = FlowSensor::flowLpm();
+  updateLed(f < FLOW_ZERO_EPS ? 0.0f : f, now);
 }
 
 // Cố gắng đảm bảo có mạng + MQTT (không chặn quá lâu, có chu kỳ thử lại).
@@ -110,6 +197,9 @@ void setup() {
   DEBUG_SERIAL.begin(DEBUG_BAUD);
   DEBUG_SERIAL.println(F("\n=== Water Meter 4G khoi dong ==="));
 
+  pinMode(PIN_STATUS_LED, OUTPUT);
+  digitalWrite(PIN_STATUS_LED, HIGH);   // PC13 active-low: HIGH = tắt lúc đầu
+
   Led::begin();
   Led::set(Led::NO_WATER);
 
@@ -118,6 +208,8 @@ void setup() {
   DataBuffer::begin();
 
   Modem::begin();
+  Modem::onMessage(Command::handle);   // nhận lệnh từ topic /cmd -> xếp hàng đợi
+  Modem::onIdle(onModemIdle);          // đo & đệm số đo khi modem bận gửi SMS
   Modem::powerOn();
   if (Modem::bringUpNetwork()) {
     Modem::mqttConnect();
@@ -129,40 +221,49 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
+  // 0) Heartbeat LED onboard PC13 (nháy khi chưa nhận module, sáng khi đã nhận)
+  updateHeartbeat(now);
+
   // 1) Cập nhật pin/nguồn định kỳ (2s/lần)
   if (now - g_lastBattTs >= 2000) {
     g_lastBattTs = now;
     Battery::update();
   }
 
-  // 2) Cập nhật lưu lượng theo cửa sổ đo
-  if (FlowSensor::update(now)) {
-    float flow  = FlowSensor::flowLpm();
-    float total = FlowSensor::totalLiters();
-    if (flow < FLOW_ZERO_EPS) flow = 0.0f;
+  // 2) Đo lưu lượng theo cửa sổ & gửi/đệm số đo
+  serviceFlow(now, /*bufferOnly=*/false);
 
-    bool flowing = flow > 0.0f;
-    bool doSend  = false;
+  // 3) Bảo đảm kết nối
+  ensureConnectivity(now);
+  bool mqttUp = Modem::mqttConnected();
+  if (!mqttUp) g_subscribed = false;                    // mất kết nối -> phải đăng ký lại
 
-    if (flowing && !g_wasFlowing) doSend = true;               // bắt đầu có nước
-    if (!flowing && g_wasFlowing) doSend = true;               // dòng chảy về 0
-    if (fabsf(flow - g_lastSentFlow) >= FLOW_SUDDEN_DELTA)     // thay đổi đột ngột
-      doSend = true;
-    if (flowing && (now - g_lastPeriodic >= SEND_INTERVAL_MS)) // định kỳ 5s
-      doSend = true;
+  // Đăng ký /cmd: thử lại mỗi vòng tới khi thành công (không bỏ sót lệnh SMS)
+  if (mqttUp && !g_subscribed)
+    g_subscribed = Modem::mqttSubscribe(MQTT_TOPIC_CMD, MQTT_SUB_QOS);
 
-    if (doSend) {
-      sendOrBuffer(flow, total, Battery::percent(), Battery::onExternalPower());
-      g_lastPeriodic = now;
-    }
-    g_wasFlowing = flowing;
+  // Gửi /info một lần khi vừa (tái) kết nối
+  if (mqttUp && !g_prevMqtt) sendInfoOnce();
+  g_prevMqtt = mqttUp;
+
+  // 4) Nhận lệnh điều khiển đến từ /cmd (chỉ xếp hàng đợi, không gửi ở đây)
+  Modem::poll();
+
+  // 5) Có lệnh SMS -> modem tạm ngưng MQTT để gửi; trong lúc đó bơm rảnh
+  //    (onModemIdle) vẫn cho STM32 đo xung & đệm số đo vào RAM.
+  if (Command::hasSms()) {
+    g_smsBusy = true;
+    char to[20], text[SMS_MAX_TEXT_LEN + 1];
+    while (Command::nextSms(to, sizeof(to), text, sizeof(text)))
+      Modem::sendSms(to, text);
+    g_smsBusy = false;
+    g_prevMqtt = Modem::mqttConnected();   // đồng bộ lại mốc trạng thái MQTT
   }
 
-  // 3) Bảo đảm kết nối + gửi bù dữ liệu đệm
-  ensureConnectivity(now);
+  // 6) Gửi bù dữ liệu đã đệm (kể cả phần đệm trong lúc gửi SMS)
   if (Modem::mqttConnected() && !DataBuffer::empty()) flushBuffer();
 
-  // 4) LED trạng thái
+  // 7) LED trạng thái
   updateLed(FlowSensor::flowLpm() < FLOW_ZERO_EPS ? 0.0f : FlowSensor::flowLpm(),
             now);
 }
